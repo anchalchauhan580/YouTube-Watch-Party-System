@@ -1,6 +1,7 @@
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
+const crypto = require("crypto");
 const { Server } = require("socket.io");
 
 const app = express();
@@ -21,10 +22,30 @@ const io = new Server(server, {
 const createRoomState = (hostToken) => ({
   hostToken,
   participants: [],
+  controlRequests: [],
   videoId: "SqcY0GlETPk",
   playState: "paused",
   currentTime: 0,
 });
+
+const canControl = (participant) =>
+  participant?.role === "Host" || participant?.role === "Moderator";
+
+const emitControlRequests = (roomId, room) => {
+  const requests = room.controlRequests;
+
+  room.participants.filter(canControl).forEach((participant) => {
+    io.to(participant.userId).emit("control_requests", { requests });
+  });
+};
+
+const emitSyncState = (roomId, room) => {
+  io.to(roomId).emit("sync_state", {
+    playState: room.playState,
+    currentTime: room.currentTime,
+    videoId: room.videoId,
+  });
+};
 
 const addParticipant = (socket, roomId, username, room, role) => {
   const existingUser = room.participants.find(
@@ -49,6 +70,10 @@ const addParticipant = (socket, roomId, username, room, role) => {
     participants: room.participants,
   });
 
+  if (canControl(room.participants.at(-1))) {
+    emitControlRequests(roomId, room);
+  }
+
   socket.emit("sync_state", {
     playState: room.playState,
     currentTime: room.currentTime,
@@ -69,7 +94,13 @@ io.on("connection", (socket) => {
 
     let room = rooms[roomId];
 
-    if (room && room.hostToken !== hostToken) return;
+    if (room && room.hostToken !== hostToken) {
+      socket.emit("room_creation_failed", {
+        roomId,
+        message: "That room code is already in use. Please create another room.",
+      });
+      return;
+    }
 
     if (!room) {
       room = createRoomState(hostToken);
@@ -91,10 +122,92 @@ io.on("connection", (socket) => {
     addParticipant(socket, roomId, username, room, "Participant");
   });
 
+  socket.on("request_control", ({ roomId, action, value }) => {
+    const room = rooms[roomId];
+    const participant = room?.participants.find(
+      (user) => user.userId === socket.id
+    );
+
+    if (!room || !participant || participant.role !== "Participant") return;
+
+    if (room.controlRequests.some((request) => request.userId === socket.id)) {
+      socket.emit("control_request_status", {
+        status: "error",
+        message: "You already have a request awaiting review.",
+      });
+      return;
+    }
+
+    const validAction = ["play", "pause", "seek", "change_video"].includes(action);
+    const validValue = action === "change_video"
+      ? typeof value === "string" && /^[a-zA-Z0-9_-]{11}$/.test(value)
+      : Number.isFinite(value) && value >= 0;
+
+    if (!validAction || !validValue) {
+      socket.emit("control_request_status", {
+        status: "error",
+        message: "That control request is invalid.",
+      });
+      return;
+    }
+
+    const request = {
+      requestId: crypto.randomUUID(),
+      userId: socket.id,
+      username: participant.username,
+      action,
+      value,
+    };
+
+    room.controlRequests.push(request);
+    socket.emit("control_request_status", {
+      status: "pending",
+      message: "Your request is waiting for Host or Moderator approval.",
+    });
+    emitControlRequests(roomId, room);
+  });
+
+  socket.on("review_control_request", ({ roomId, requestId, approved }) => {
+    const room = rooms[roomId];
+    const reviewer = room?.participants.find(
+      (user) => user.userId === socket.id
+    );
+
+    if (!room || !canControl(reviewer) || typeof approved !== "boolean") return;
+
+    const requestIndex = room.controlRequests.findIndex(
+      (request) => request.requestId === requestId
+    );
+    if (requestIndex === -1) return;
+
+    const [request] = room.controlRequests.splice(requestIndex, 1);
+
+    if (approved) {
+      if (request.action === "play" || request.action === "pause") {
+        room.playState = request.action === "play" ? "playing" : "paused";
+        room.currentTime = request.value;
+      } else if (request.action === "seek") {
+        room.currentTime = request.value;
+      } else if (request.action === "change_video") {
+        room.videoId = request.value;
+        room.playState = "paused";
+        room.currentTime = 0;
+      }
+
+      emitSyncState(roomId, room);
+    }
+
+    io.to(request.userId).emit("control_request_status", {
+      status: approved ? "approved" : "rejected",
+      message: approved ? "Your request was approved." : "Your request was declined.",
+    });
+    emitControlRequests(roomId, room);
+  });
+
   // PLAY
   socket.on("play", ({ roomId, currentTime }) => {
     const room = rooms[roomId];
-    if (!room) return;
+    if (!room || !Number.isFinite(currentTime) || currentTime < 0) return;
 
     const user = room.participants.find(
       (participant) => participant.userId === socket.id
@@ -102,12 +215,7 @@ io.on("connection", (socket) => {
 
     if (!user) return;
 
-    if (
-      user.role !== "Host" &&
-      user.role !== "Moderator"
-    ) {
-      return;
-    }
+    if (!canControl(user)) return;
 
     room.playState = "playing";
     room.currentTime = currentTime;
@@ -122,7 +230,7 @@ io.on("connection", (socket) => {
   // PAUSE
   socket.on("pause", ({ roomId, currentTime }) => {
     const room = rooms[roomId];
-    if (!room) return;
+    if (!room || !Number.isFinite(currentTime) || currentTime < 0) return;
 
     const user = room.participants.find(
       (participant) => participant.userId === socket.id
@@ -130,12 +238,7 @@ io.on("connection", (socket) => {
 
     if (!user) return;
 
-    if (
-      user.role !== "Host" &&
-      user.role !== "Moderator"
-    ) {
-      return;
-    }
+    if (!canControl(user)) return;
 
     room.playState = "paused";
     room.currentTime = currentTime;
@@ -150,7 +253,7 @@ io.on("connection", (socket) => {
   // SEEK
   socket.on("seek", ({ roomId, time }) => {
     const room = rooms[roomId];
-    if (!room) return;
+    if (!room || !Number.isFinite(time) || time < 0) return;
 
     const user = room.participants.find(
       (participant) => participant.userId === socket.id
@@ -158,12 +261,7 @@ io.on("connection", (socket) => {
 
     if (!user) return;
 
-    if (
-      user.role !== "Host" &&
-      user.role !== "Moderator"
-    ) {
-      return;
-    }
+    if (!canControl(user)) return;
 
     room.currentTime = time;
 
@@ -177,7 +275,7 @@ io.on("connection", (socket) => {
   // CHANGE VIDEO
   socket.on("change_video", ({ roomId, videoId }) => {
     const room = rooms[roomId];
-    if (!room) return;
+    if (!room || typeof videoId !== "string" || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return;
 
     const user = room.participants.find(
       (participant) => participant.userId === socket.id
@@ -185,12 +283,7 @@ io.on("connection", (socket) => {
 
     if (!user) return;
 
-    if (
-      user.role !== "Host" &&
-      user.role !== "Moderator"
-    ) {
-      return;
-    }
+    if (!canControl(user)) return;
 
     room.videoId = videoId;
     room.playState = "paused";
@@ -222,7 +315,7 @@ io.on("connection", (socket) => {
         (participant) => participant.userId === userId
       );
 
-      if (!user) return;
+      if (!user || userId === socket.id) return;
 
       if (
         role !== "Participant" &&
@@ -233,6 +326,16 @@ io.on("connection", (socket) => {
 
       user.role = role;
 
+      if (role === "Moderator") {
+        room.controlRequests = room.controlRequests.filter(
+          (request) => request.userId !== userId
+        );
+        io.to(userId).emit("control_request_status", {
+          status: "error",
+          message: "Your role changed; you can now control playback directly.",
+        });
+      }
+
       console.log(
         `${user.username} is now ${role}`
       );
@@ -240,6 +343,7 @@ io.on("connection", (socket) => {
       io.to(roomId).emit("role_assigned", {
         participants: room.participants,
       });
+      emitControlRequests(roomId, room);
     }
   );
 
@@ -262,12 +366,15 @@ io.on("connection", (socket) => {
         (participant) => participant.userId === userId
       );
 
-      if (userIndex === -1) return;
+      if (userIndex === -1 || userId === socket.id) return;
 
       const removedUser =
         room.participants[userIndex];
 
       room.participants.splice(userIndex, 1);
+      room.controlRequests = room.controlRequests.filter(
+        (request) => request.userId !== userId
+      );
 
       console.log(
         `${removedUser.username} was removed from room ${roomId} by Host`
@@ -281,6 +388,7 @@ io.on("connection", (socket) => {
       io.to(roomId).emit("user_left", {
         participants: room.participants,
       });
+      emitControlRequests(roomId, room);
 
       const removedSocket =
         io.sockets.sockets.get(userId);
@@ -307,6 +415,9 @@ io.on("connection", (socket) => {
     const user = room.participants[userIndex];
 
     room.participants.splice(userIndex, 1);
+    room.controlRequests = room.controlRequests.filter(
+      (request) => request.userId !== socket.id
+    );
 
     socket.leave(roomId);
 
@@ -322,6 +433,7 @@ io.on("connection", (socket) => {
       userId: socket.id,
       participants: room.participants,
     });
+    emitControlRequests(roomId, room);
 
     console.log(
       `${user.username} left room ${roomId}`
@@ -360,12 +472,16 @@ io.on("connection", (socket) => {
     const user = room.participants[userIndex];
 
     room.participants.splice(userIndex, 1);
+    room.controlRequests = room.controlRequests.filter(
+      (request) => request.userId !== socket.id
+    );
 
     io.to(roomId).emit("user_left", {
       username: user.username,
       userId: socket.id,
       participants: room.participants,
     });
+    emitControlRequests(roomId, room);
 
     if (room.participants.length === 0) {
       delete rooms[roomId];

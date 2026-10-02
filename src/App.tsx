@@ -20,11 +20,28 @@ type SyncData = {
   videoId: string;
 };
 
+type ControlRequest = {
+  requestId: string;
+  userId: string;
+  username: string;
+  action: "play" | "pause" | "seek" | "change_video";
+  value: number | string;
+};
+
 type YouTubePlayer = {
   getCurrentTime: () => number;
+  getDuration: () => number;
   seekTo: (time: number, allowSeekAhead?: boolean) => void;
   playVideo: () => void;
   pauseVideo: () => void;
+};
+
+const formatTime = (seconds: number) => {
+  const safeSeconds = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0;
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainder = String(safeSeconds % 60).padStart(2, "0");
+
+  return `${minutes}:${remainder}`;
 };
 
 function App() {
@@ -33,6 +50,13 @@ function App() {
   const [joinRoomId, setJoinRoomId] = useState("");
   const [joinUsername, setJoinUsername] = useState("");
   const [participants, setParticipants] = useState<Participant[]>([]);
+  const [controlRequests, setControlRequests] = useState<ControlRequest[]>([]);
+  const [requestedSeekTime, setRequestedSeekTime] = useState("");
+  const [controlRequestMessage, setControlRequestMessage] = useState("");
+  const [isControlRequestPending, setIsControlRequestPending] = useState(false);
+  const [playbackTime, setPlaybackTime] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
 
   const [videoId, setVideoId] = useState("SqcY0GlETPk");
   const [videoUrl, setVideoUrl] = useState("");
@@ -49,6 +73,7 @@ function App() {
   const playerStateRef = useRef(2);
 
   const seekTimerRef = useRef<number | null>(null);
+  const playbackUiTimerRef = useRef<number | null>(null);
   const pendingSyncRef = useRef<SyncData | null>(null);
 
   const roomIdRef = useRef("");
@@ -87,6 +112,57 @@ function App() {
     canControlRef.current = canControl;
   }, [canControl]);
 
+  const requestControl = (
+    action: ControlRequest["action"],
+    value: number | string
+  ) => {
+    if (!roomId || !isConnected || currentRole !== "Participant") return;
+
+    setControlRequestMessage("Sending request...");
+    setIsControlRequestPending(true);
+    socket.emit("request_control", {
+      roomId: roomIdRef.current,
+      action,
+      value,
+    });
+  };
+
+  const reviewControlRequest = (requestId: string, approved: boolean) => {
+    if (!roomId || !canControl) return;
+
+    socket.emit("review_control_request", {
+      roomId: roomIdRef.current,
+      requestId,
+      approved,
+    });
+  };
+
+  const togglePlayback = () => {
+    if (!canControl || !playerRef.current) return;
+
+    if (isPlaying) {
+      playerRef.current.pauseVideo();
+    } else {
+      playerRef.current.playVideo();
+    }
+  };
+
+  const seekPlayback = (time: number) => {
+    if (!canControl || !playerRef.current) return;
+
+    playerRef.current.seekTo(time, true);
+    lastTimeRef.current = time;
+    setPlaybackTime(time);
+  };
+
+  const publishPlaybackSeek = () => {
+    if (!canControl || !playerRef.current || !roomIdRef.current) return;
+
+    const time = playerRef.current.getCurrentTime();
+    lastTimeRef.current = time;
+    socket.emit("seek", { roomId: roomIdRef.current, time });
+  };
+
   // Track socket connection for UI indicator
   useEffect(() => {
     const handleConnect = () => setIsConnected(true);
@@ -118,7 +194,12 @@ function App() {
     const hostToken = crypto.randomUUID();
 
     setRoomId(newRoomId);
+    roomIdRef.current = newRoomId;
     roomHostTokenRef.current = hostToken;
+    setParticipants([]);
+    setControlRequests([]);
+    setControlRequestMessage("");
+    setIsControlRequestPending(false);
 
     socket.emit("create_room", {
       roomId: newRoomId,
@@ -139,7 +220,12 @@ function App() {
     const name = joinUsername.trim();
 
     setRoomId(roomCode);
+    roomIdRef.current = roomCode;
     roomHostTokenRef.current = null;
+    setParticipants([]);
+    setControlRequests([]);
+    setControlRequestMessage("");
+    setIsControlRequestPending(false);
 
     socket.emit("join_room", {
       roomId: roomCode,
@@ -175,7 +261,7 @@ function App() {
       return;
     }
 
-    if (!canControl) {
+    if (!canControl && currentRole !== "Participant") {
       alert("Only Host or Moderator can change the video");
       return;
     }
@@ -189,6 +275,12 @@ function App() {
 
     if (!newVideoId) {
       alert("Please enter a valid YouTube URL");
+      return;
+    }
+
+    if (!canControl) {
+      requestControl("change_video", newVideoId);
+      setVideoUrl("");
       return;
     }
 
@@ -249,6 +341,9 @@ function App() {
     if (window.confirm("Are you sure you want to leave this watch party?")) {
       setRoomId("");
       setParticipants([]);
+      setControlRequests([]);
+      setControlRequestMessage("");
+      setIsControlRequestPending(false);
       roomIdRef.current = "";
       roomHostTokenRef.current = null;
       playerRef.current = null;
@@ -316,6 +411,9 @@ function App() {
       return;
     }
 
+    setPlaybackTime(data.currentTime);
+    setIsPlaying(data.playState === "playing");
+
     // ---------------- DIFFERENT VIDEO ----------------
 
     if (
@@ -339,17 +437,6 @@ function App() {
 
     if (!playerRef.current) {
       pendingSyncRef.current = data;
-      return;
-    }
-
-    // ---------------- INITIAL STATE ----------------
-
-    if (
-      data.playState === "paused" &&
-      data.currentTime === 0
-    ) {
-      lastTimeRef.current = 0;
-      playerStateRef.current = 2;
       return;
     }
 
@@ -435,6 +522,18 @@ function App() {
       setParticipants(data.participants);
     };
 
+    const handleControlRequests = (data: { requests: ControlRequest[] }) => {
+      setControlRequests(data.requests);
+    };
+
+    const handleControlRequestStatus = (data: {
+      status: string;
+      message: string;
+    }) => {
+      setControlRequestMessage(data.message);
+      setIsControlRequestPending(data.status === "pending");
+    };
+
     const handleSyncState = (data: SyncData) => {
       console.log("SYNC STATE RECEIVED:", data);
 
@@ -458,6 +557,7 @@ function App() {
       roomHostTokenRef.current = null;
 
       setParticipants([]);
+      setControlRequests([]);
 
       playerRef.current = null;
       pendingSyncRef.current = null;
@@ -507,6 +607,19 @@ function App() {
       alert("Room not found");
     };
 
+    const handleRoomCreationFailed = (data: {
+      roomId: string;
+      message: string;
+    }) => {
+      if (data.roomId !== roomIdRef.current) return;
+
+      roomIdRef.current = "";
+      setRoomId("");
+      setParticipants([]);
+      roomHostTokenRef.current = null;
+      alert(data.message);
+    };
+
     socket.on(
       "user_joined",
       handleUserJoined
@@ -522,6 +635,9 @@ function App() {
       handleRoleAssigned
     );
 
+    socket.on("control_requests", handleControlRequests);
+    socket.on("control_request_status", handleControlRequestStatus);
+
     socket.on(
       "sync_state",
       handleSyncState
@@ -536,6 +652,8 @@ function App() {
       "room_not_found",
       handleRoomNotFound
     );
+
+    socket.on("room_creation_failed", handleRoomCreationFailed);
 
     socket.on(
       "connect",
@@ -558,6 +676,9 @@ function App() {
         handleRoleAssigned
       );
 
+      socket.off("control_requests", handleControlRequests);
+      socket.off("control_request_status", handleControlRequestStatus);
+
       socket.off(
         "sync_state",
         handleSyncState
@@ -572,6 +693,8 @@ function App() {
         "room_not_found",
         handleRoomNotFound
       );
+
+      socket.off("room_creation_failed", handleRoomCreationFailed);
 
       socket.off(
         "connect",
@@ -656,6 +779,9 @@ function App() {
     data: number;
   }) => {
     const newState = event.data;
+
+    if (newState === 1) setIsPlaying(true);
+    if (newState === 2) setIsPlaying(false);
 
     playerStateRef.current = newState;
 
@@ -789,6 +915,18 @@ function App() {
 
     lastTimeRef.current =
       event.target.getCurrentTime();
+    setPlaybackTime(event.target.getCurrentTime());
+    setVideoDuration(event.target.getDuration());
+
+    if (playbackUiTimerRef.current !== null) {
+      window.clearInterval(playbackUiTimerRef.current);
+    }
+    playbackUiTimerRef.current = window.setInterval(() => {
+      if (playerRef.current) {
+        setPlaybackTime(playerRef.current.getCurrentTime());
+        setVideoDuration(playerRef.current.getDuration());
+      }
+    }, 500);
 
     if (
       pendingSyncRef.current
@@ -821,6 +959,11 @@ function App() {
         );
 
         seekTimerRef.current = null;
+      }
+
+      if (playbackUiTimerRef.current !== null) {
+        window.clearInterval(playbackUiTimerRef.current);
+        playbackUiTimerRef.current = null;
       }
     };
   }, []);
@@ -1025,6 +1168,8 @@ function App() {
                     height: "100%",
                     playerVars: {
                       autoplay: 0,
+                      controls: 0,
+                      disablekb: 1,
                       modestbranding: 1,
                       rel: 0,
                     },
@@ -1032,7 +1177,45 @@ function App() {
                   className="youtube-container"
                   iframeClassName="youtube-iframe"
                 />
+                {!canControl && (
+                  <div
+                    className="player-interaction-shield"
+                    aria-label="Playback controls are limited to Hosts and Moderators"
+                  />
+                )}
               </div>
+
+              {canControl && (
+                <div className="playback-control-panel">
+                  <button
+                    type="button"
+                    className="playback-toggle-btn"
+                    onClick={togglePlayback}
+                    aria-label={isPlaying ? "Pause video" : "Play video"}
+                  >
+                    {isPlaying ? "Pause" : "Play"}
+                  </button>
+                  <span className="playback-time-label">
+                    {formatTime(playbackTime)}
+                  </span>
+                  <input
+                    className="playback-seek-input"
+                    type="range"
+                    min="0"
+                    max={videoDuration || 0}
+                    step="0.25"
+                    value={Math.min(playbackTime, videoDuration || 0)}
+                    onChange={(event) => seekPlayback(Number(event.target.value))}
+                    onPointerUp={publishPlaybackSeek}
+                    onKeyUp={publishPlaybackSeek}
+                    aria-label="Seek video"
+                    disabled={!videoDuration}
+                  />
+                  <span className="playback-time-label">
+                    {formatTime(videoDuration)}
+                  </span>
+                </div>
+              )}
 
               <div className="video-switch-card">
                 <input
@@ -1041,7 +1224,9 @@ function App() {
                   placeholder={
                     canControl
                       ? "Paste a YouTube link to switch videos"
-                      : "Only Host and Moderators can change videos"
+                      : currentRole === "Participant"
+                      ? "Paste a YouTube link to request a video change"
+                      : "Waiting for room access..."
                   }
                   value={videoUrl}
                   onChange={(e) => setVideoUrl(e.target.value)}
@@ -1051,17 +1236,85 @@ function App() {
                       changeVideo();
                     }
                   }}
-                  disabled={!canControl}
+                  disabled={!canControl && currentRole !== "Participant"}
                 />
                 <button
                   type="button"
                   className="video-switch-btn"
                   onClick={changeVideo}
-                  disabled={!canControl || !videoUrl.trim()}
+                  disabled={
+                    (!canControl && currentRole !== "Participant") ||
+                    !videoUrl.trim() ||
+                    isControlRequestPending
+                  }
                 >
-                  Change video
+                  {canControl ? "Change video" : "Request video"}
                 </button>
               </div>
+
+              {currentRole === "Participant" && (
+                <div className="control-request-panel">
+                  <div className="control-request-heading">Request playback control</div>
+                  <div className="control-request-actions">
+                    <button
+                      type="button"
+                      className="request-action-btn"
+                      disabled={!isConnected || isControlRequestPending}
+                      onClick={() =>
+                        requestControl(
+                          "play",
+                          playerRef.current?.getCurrentTime() || 0
+                        )
+                      }
+                    >
+                      Request play
+                    </button>
+                    <button
+                      type="button"
+                      className="request-action-btn"
+                      disabled={!isConnected || isControlRequestPending}
+                      onClick={() =>
+                        requestControl(
+                          "pause",
+                          playerRef.current?.getCurrentTime() || 0
+                        )
+                      }
+                    >
+                      Request pause
+                    </button>
+                    <label className="seek-request-field">
+                      <span>Seek to (seconds)</span>
+                      <input
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={requestedSeekTime}
+                        onChange={(event) => setRequestedSeekTime(event.target.value)}
+                        disabled={!isConnected || isControlRequestPending}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="request-action-btn"
+                      disabled={
+                        !isConnected ||
+                        isControlRequestPending ||
+                        requestedSeekTime === "" ||
+                        Number(requestedSeekTime) < 0
+                      }
+                      onClick={() => {
+                        requestControl("seek", Number(requestedSeekTime));
+                        setRequestedSeekTime("");
+                      }}
+                    >
+                      Request seek
+                    </button>
+                  </div>
+                  <div className="control-request-status" role="status" aria-live="polite">
+                    {controlRequestMessage || "A Host or Moderator must approve your request."}
+                  </div>
+                </div>
+              )}
 
               <div className="player-info-bar">
                 <span className="permission-notice">
@@ -1256,6 +1509,45 @@ function App() {
                   )}
                 </div>
               </div>
+
+              {canControl && controlRequests.length > 0 && (
+                <div className="sidebar-card control-requests-card">
+                  <div className="card-header-row">
+                    <h2 className="card-title">Control requests</h2>
+                    <span className="count-pill">{controlRequests.length}</span>
+                  </div>
+                  <div className="control-requests-list">
+                    {controlRequests.map((request) => (
+                      <div className="control-request-item" key={request.requestId}>
+                        <div className="control-request-description">
+                          <strong>{request.username}</strong> requested{" "}
+                          {request.action === "change_video"
+                            ? "a video change"
+                            : request.action === "seek"
+                            ? `a seek to ${request.value} seconds`
+                            : `to ${request.action}`}
+                        </div>
+                        <div className="control-request-review-actions">
+                          <button
+                            type="button"
+                            className="request-approve-btn"
+                            onClick={() => reviewControlRequest(request.requestId, true)}
+                          >
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            className="request-reject-btn"
+                            onClick={() => reviewControlRequest(request.requestId, false)}
+                          >
+                            Decline
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </aside>
           </div>
         </main>
