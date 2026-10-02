@@ -193,6 +193,10 @@ function App() {
     const name = username.trim();
     const hostToken = crypto.randomUUID();
 
+    if (roomIdRef.current && roomIdRef.current !== newRoomId) {
+      socket.emit("leave_room", { roomId: roomIdRef.current });
+    }
+
     setRoomId(newRoomId);
     roomIdRef.current = newRoomId;
     roomHostTokenRef.current = hostToken;
@@ -218,6 +222,10 @@ function App() {
 
     const roomCode = joinRoomId.trim().toUpperCase();
     const name = joinUsername.trim();
+
+    if (roomIdRef.current && roomIdRef.current !== roomCode) {
+      socket.emit("leave_room", { roomId: roomIdRef.current });
+    }
 
     setRoomId(roomCode);
     roomIdRef.current = roomCode;

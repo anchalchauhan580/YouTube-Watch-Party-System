@@ -19,8 +19,9 @@ const io = new Server(server, {
   },
 });
 
-const createRoomState = (hostToken) => ({
+const createRoomState = (hostToken, creatorUserId) => ({
   hostToken,
+  creatorUserId,
   participants: [],
   controlRequests: [],
   videoId: "SqcY0GlETPk",
@@ -47,7 +48,55 @@ const emitSyncState = (roomId, room) => {
   });
 };
 
-const addParticipant = (socket, roomId, username, room, role) => {
+const removeSocketFromRoom = (socket, roomId, { notify = true } = {}) => {
+  const room = rooms[roomId];
+  if (!room) {
+    if (socket.data.roomId === roomId) {
+      socket.data.roomId = null;
+    }
+    return;
+  }
+
+  const userIndex = room.participants.findIndex(
+    (user) => user.userId === socket.id
+  );
+
+  if (userIndex === -1) {
+    socket.leave(roomId);
+    if (socket.data.roomId === roomId) {
+      socket.data.roomId = null;
+    }
+    return;
+  }
+
+  const [user] = room.participants.splice(userIndex, 1);
+  if (room.creatorUserId === socket.id) {
+    room.creatorUserId = null;
+  }
+  room.controlRequests = room.controlRequests.filter(
+    (request) => request.userId !== socket.id
+  );
+
+  socket.leave(roomId);
+  if (socket.data.roomId === roomId) {
+    socket.data.roomId = null;
+  }
+
+  if (notify && user) {
+    io.to(roomId).emit("user_left", {
+      username: user.username,
+      userId: socket.id,
+      participants: room.participants,
+    });
+    emitControlRequests(roomId, room);
+  }
+
+  if (room.participants.length === 0) {
+    delete rooms[roomId];
+  }
+};
+
+const addRoomMember = (socket, roomId, username, room, role) => {
   const existingUser = room.participants.find(
     (user) => user.userId === socket.id
   );
@@ -81,6 +130,12 @@ const addParticipant = (socket, roomId, username, room, role) => {
   });
 };
 
+const addHost = (socket, roomId, username, room) =>
+  addRoomMember(socket, roomId, username, room, "Host");
+
+const addParticipant = (socket, roomId, username, room) =>
+  addRoomMember(socket, roomId, username, room, "Participant");
+
 app.get("/", (req, res) => {
   res.send("Watch Party Server is running");
 });
@@ -90,36 +145,71 @@ io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
   socket.on("create_room", ({ roomId, username, hostToken }) => {
-    if (!roomId || !username || !hostToken) return;
+    const cleanRoomId = String(roomId || "").trim().toUpperCase();
+    const cleanUsername = String(username || "").trim();
 
-    let room = rooms[roomId];
+    if (!cleanRoomId || !cleanUsername || !hostToken) return;
+
+    const previousRoomId = socket.data.roomId;
+    if (previousRoomId && previousRoomId !== cleanRoomId) {
+      removeSocketFromRoom(socket, previousRoomId, { notify: true });
+    }
+
+    let room = rooms[cleanRoomId];
 
     if (room && room.hostToken !== hostToken) {
       socket.emit("room_creation_failed", {
-        roomId,
+        roomId: cleanRoomId,
         message: "That room code is already in use. Please create another room.",
       });
       return;
     }
 
     if (!room) {
-      room = createRoomState(hostToken);
-      rooms[roomId] = room;
+      room = createRoomState(hostToken, socket.id);
+      rooms[cleanRoomId] = room;
     }
 
-    addParticipant(socket, roomId, username, room, "Host");
-  });
-
-  socket.on("join_room", ({ roomId, username }) => {
-    if (!roomId || !username) return;
-
-    const room = rooms[roomId];
-    if (!room) {
-      socket.emit("room_not_found", { roomId });
+    if (room.participants.some((participant) => participant.userId === socket.id)) {
+      socket.emit("sync_state", {
+        playState: room.playState,
+        currentTime: room.currentTime,
+        videoId: room.videoId,
+      });
       return;
     }
 
-    addParticipant(socket, roomId, username, room, "Participant");
+    room.creatorUserId = socket.id;
+    addHost(socket, cleanRoomId, cleanUsername, room);
+  });
+
+  socket.on("join_room", ({ roomId, username }) => {
+    const cleanRoomId = String(roomId || "").trim().toUpperCase();
+    const cleanUsername = String(username || "").trim();
+
+    if (!cleanRoomId || !cleanUsername) return;
+
+    const previousRoomId = socket.data.roomId;
+    if (previousRoomId && previousRoomId !== cleanRoomId) {
+      removeSocketFromRoom(socket, previousRoomId, { notify: true });
+    }
+
+    const room = rooms[cleanRoomId];
+    if (!room) {
+      socket.emit("room_not_found", { roomId: cleanRoomId });
+      return;
+    }
+
+    if (room.participants.some((participant) => participant.userId === socket.id)) {
+      socket.emit("sync_state", {
+        playState: room.playState,
+        currentTime: room.currentTime,
+        videoId: room.videoId,
+      });
+      return;
+    }
+
+    addParticipant(socket, cleanRoomId, cleanUsername, room);
   });
 
   socket.on("request_control", ({ roomId, action, value }) => {
