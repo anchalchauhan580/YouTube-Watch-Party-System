@@ -67,6 +67,20 @@ function App() {
   const [confirmRemoveUserId, setConfirmRemoveUserId] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(socket.connected);
 
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const codeFromUrl = params.get("room") || params.get("roomId") || params.get("code");
+      if (codeFromUrl) {
+        const cleanCode = codeFromUrl.trim().toUpperCase().slice(0, 6);
+        setJoinRoomId(cleanCode);
+        setActiveTab("join");
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
   const playerRef = useRef<YouTubePlayer | null>(null);
 
   const lastTimeRef = useRef(0);
@@ -193,6 +207,13 @@ function App() {
     const name = username.trim();
     const hostToken = crypto.randomUUID();
 
+    try {
+      localStorage.setItem(`host_token_${newRoomId}`, hostToken);
+      localStorage.setItem(`creator_name_${newRoomId}`, name);
+    } catch {
+      // ignore
+    }
+
     if (roomIdRef.current && roomIdRef.current !== newRoomId) {
       socket.emit("leave_room", { roomId: roomIdRef.current });
     }
@@ -209,6 +230,8 @@ function App() {
       roomId: newRoomId,
       username: name,
       hostToken,
+      action: "create",
+      isCreator: true,
     });
   };
 
@@ -223,22 +246,46 @@ function App() {
     const roomCode = joinRoomId.trim().toUpperCase();
     const name = joinUsername.trim();
 
+    // Check if this user was the original creator of this room (reconnection after refresh)
+    let savedHostToken: string | null = null;
+    try {
+      const storedToken = localStorage.getItem(`host_token_${roomCode}`);
+      const storedName = localStorage.getItem(`creator_name_${roomCode}`);
+      if (storedToken && storedName && storedName.toLowerCase() === name.toLowerCase()) {
+        savedHostToken = storedToken;
+      }
+    } catch {
+      savedHostToken = null;
+    }
+
     if (roomIdRef.current && roomIdRef.current !== roomCode) {
       socket.emit("leave_room", { roomId: roomIdRef.current });
     }
 
     setRoomId(roomCode);
     roomIdRef.current = roomCode;
-    roomHostTokenRef.current = null;
+    roomHostTokenRef.current = savedHostToken;
     setParticipants([]);
     setControlRequests([]);
     setControlRequestMessage("");
     setIsControlRequestPending(false);
 
-    socket.emit("join_room", {
-      roomId: roomCode,
-      username: name,
-    });
+    if (savedHostToken) {
+      socket.emit("create_room", {
+        roomId: roomCode,
+        username: name,
+        hostToken: savedHostToken,
+        action: "create",
+        isCreator: true,
+      });
+    } else {
+      socket.emit("join_room", {
+        roomId: roomCode,
+        username: name,
+        action: "join",
+        isCreator: false,
+      });
+    }
   };
 
   // ---------------- YOUTUBE VIDEO ID ----------------
@@ -347,6 +394,16 @@ function App() {
 
   const leaveRoom = () => {
     if (window.confirm("Are you sure you want to leave this watch party?")) {
+      const leavingRoomId = roomIdRef.current;
+      if (leavingRoomId) {
+        socket.emit("leave_room", { roomId: leavingRoomId });
+        try {
+          localStorage.removeItem(`host_token_${leavingRoomId}`);
+          localStorage.removeItem(`creator_name_${leavingRoomId}`);
+        } catch {
+          // ignore
+        }
+      }
       setRoomId("");
       setParticipants([]);
       setControlRequests([]);
@@ -560,6 +617,13 @@ function App() {
 
       alert("You have been removed from the room");
 
+      try {
+        localStorage.removeItem(`host_token_${data.roomId}`);
+        localStorage.removeItem(`creator_name_${data.roomId}`);
+      } catch {
+        // ignore
+      }
+
       roomIdRef.current = "";
       setRoomId("");
       roomHostTokenRef.current = null;
@@ -584,22 +648,39 @@ function App() {
         username.trim() ||
         joinUsername.trim();
 
+      const currentRoom = roomIdRef.current;
       if (
-        roomIdRef.current &&
+        currentRoom &&
         name
       ) {
-        const hostToken = roomHostTokenRef.current;
+        let hostToken = roomHostTokenRef.current;
+        if (!hostToken) {
+          try {
+            const storedToken = localStorage.getItem(`host_token_${currentRoom}`);
+            const storedName = localStorage.getItem(`creator_name_${currentRoom}`);
+            if (storedToken && storedName && storedName.toLowerCase() === name.toLowerCase()) {
+              hostToken = storedToken;
+              roomHostTokenRef.current = storedToken;
+            }
+          } catch {
+            hostToken = null;
+          }
+        }
 
         if (hostToken) {
           socket.emit("create_room", {
-            roomId: roomIdRef.current,
+            roomId: currentRoom,
             username: name,
             hostToken,
+            action: "create",
+            isCreator: true,
           });
         } else {
           socket.emit("join_room", {
-            roomId: roomIdRef.current,
+            roomId: currentRoom,
             username: name,
+            action: "join",
+            isCreator: false,
           });
         }
       }
@@ -607,6 +688,13 @@ function App() {
 
     const handleRoomNotFound = (data: { roomId: string }) => {
       if (data.roomId !== roomIdRef.current) return;
+
+      try {
+        localStorage.removeItem(`host_token_${data.roomId}`);
+        localStorage.removeItem(`creator_name_${data.roomId}`);
+      } catch {
+        // ignore
+      }
 
       roomIdRef.current = "";
       setRoomId("");
@@ -620,6 +708,13 @@ function App() {
       message: string;
     }) => {
       if (data.roomId !== roomIdRef.current) return;
+
+      try {
+        localStorage.removeItem(`host_token_${data.roomId}`);
+        localStorage.removeItem(`creator_name_${data.roomId}`);
+      } catch {
+        // ignore
+      }
 
       roomIdRef.current = "";
       setRoomId("");
