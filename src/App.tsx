@@ -49,6 +49,7 @@ function App() {
   const pendingSyncRef = useRef<SyncData | null>(null);
 
   const roomIdRef = useRef("");
+  const roomHostTokenRef = useRef<string | null>(null);
   const videoIdRef = useRef(videoId);
 
   const canControlRef = useRef(false);
@@ -111,12 +112,15 @@ function App() {
       .toUpperCase();
 
     const name = username.trim();
+    const hostToken = crypto.randomUUID();
 
     setRoomId(newRoomId);
+    roomHostTokenRef.current = hostToken;
 
-    socket.emit("join_room", {
+    socket.emit("create_room", {
       roomId: newRoomId,
       username: name,
+      hostToken,
     });
   };
 
@@ -132,6 +136,7 @@ function App() {
     const name = joinUsername.trim();
 
     setRoomId(roomCode);
+    roomHostTokenRef.current = null;
 
     socket.emit("join_room", {
       roomId: roomCode,
@@ -242,6 +247,7 @@ function App() {
       setRoomId("");
       setParticipants([]);
       roomIdRef.current = "";
+      roomHostTokenRef.current = null;
       playerRef.current = null;
       pendingSyncRef.current = null;
       socket.disconnect();
@@ -446,6 +452,7 @@ function App() {
 
       roomIdRef.current = "";
       setRoomId("");
+      roomHostTokenRef.current = null;
 
       setParticipants([]);
 
@@ -470,11 +477,31 @@ function App() {
         roomIdRef.current &&
         name
       ) {
-        socket.emit("join_room", {
-          roomId: roomIdRef.current,
-          username: name,
-        });
+        const hostToken = roomHostTokenRef.current;
+
+        if (hostToken) {
+          socket.emit("create_room", {
+            roomId: roomIdRef.current,
+            username: name,
+            hostToken,
+          });
+        } else {
+          socket.emit("join_room", {
+            roomId: roomIdRef.current,
+            username: name,
+          });
+        }
       }
+    };
+
+    const handleRoomNotFound = (data: { roomId: string }) => {
+      if (data.roomId !== roomIdRef.current) return;
+
+      roomIdRef.current = "";
+      setRoomId("");
+      setParticipants([]);
+      roomHostTokenRef.current = null;
+      alert("Room not found");
     };
 
     socket.on(
@@ -500,6 +527,11 @@ function App() {
     socket.on(
       "participant_removed",
       handleParticipantRemoved
+    );
+
+    socket.on(
+      "room_not_found",
+      handleRoomNotFound
     );
 
     socket.on(
@@ -531,6 +563,11 @@ function App() {
       socket.off(
         "participant_removed",
         handleParticipantRemoved
+      );
+
+      socket.off(
+        "room_not_found",
+        handleRoomNotFound
       );
 
       socket.off(

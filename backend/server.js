@@ -18,6 +18,44 @@ const io = new Server(server, {
   },
 });
 
+const createRoomState = (hostToken) => ({
+  hostToken,
+  participants: [],
+  videoId: "SqcY0GlETPk",
+  playState: "paused",
+  currentTime: 0,
+});
+
+const addParticipant = (socket, roomId, username, room, role) => {
+  const existingUser = room.participants.find(
+    (user) => user.userId === socket.id
+  );
+
+  if (existingUser) return;
+
+  room.participants.push({
+    userId: socket.id,
+    username,
+    role,
+  });
+
+  socket.join(roomId);
+  socket.data.roomId = roomId;
+  socket.data.username = username;
+
+  console.log(`${username} joined room ${roomId} as ${role}`);
+
+  io.to(roomId).emit("user_joined", {
+    participants: room.participants,
+  });
+
+  socket.emit("sync_state", {
+    playState: room.playState,
+    currentTime: room.currentTime,
+    videoId: room.videoId,
+  });
+};
+
 app.get("/", (req, res) => {
   res.send("Watch Party Server is running");
 });
@@ -26,54 +64,31 @@ app.get("/", (req, res) => {
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
+  socket.on("create_room", ({ roomId, username, hostToken }) => {
+    if (!roomId || !username || !hostToken) return;
+
+    let room = rooms[roomId];
+
+    if (room && room.hostToken !== hostToken) return;
+
+    if (!room) {
+      room = createRoomState(hostToken);
+      rooms[roomId] = room;
+    }
+
+    addParticipant(socket, roomId, username, room, "Host");
+  });
+
   socket.on("join_room", ({ roomId, username }) => {
     if (!roomId || !username) return;
 
-    if (!rooms[roomId]) {
-      rooms[roomId] = {
-        participants: [],
-        videoId: "SqcY0GlETPk",
-        playState: "paused",
-        currentTime: 0,
-      };
+    const room = rooms[roomId];
+    if (!room) {
+      socket.emit("room_not_found", { roomId });
+      return;
     }
 
-    const room = rooms[roomId];
-
-    const existingUser = room.participants.find(
-      (user) => user.userId === socket.id
-    );
-
-    if (existingUser) return;
-
-    const role =
-      room.participants.length === 0 ? "Host" : "Participant";
-
-    const participant = {
-      userId: socket.id,
-      username,
-      role,
-    };
-
-    room.participants.push(participant);
-
-    socket.join(roomId);
-    socket.data.roomId = roomId;
-    socket.data.username = username;
-
-    console.log(
-      `${username} joined room ${roomId} as ${role}`
-    );
-
-    io.to(roomId).emit("user_joined", {
-      participants: room.participants,
-    });
-
-    socket.emit("sync_state", {
-      playState: room.playState,
-      currentTime: room.currentTime,
-      videoId: room.videoId,
-    });
+    addParticipant(socket, roomId, username, room, "Participant");
   });
 
   // PLAY
