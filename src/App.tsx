@@ -3,7 +3,10 @@ import { io } from "socket.io-client";
 import YouTube from "react-youtube";
 import "./App.css";
 
-const socket = io("http://localhost:5000");
+const socket = io(
+  import.meta.env.VITE_SOCKET_URL ||
+    (import.meta.env.DEV ? "http://localhost:5000" : window.location.origin)
+);
 
 type Participant = {
   userId: string;
@@ -1134,30 +1137,15 @@ function App() {
                 <div className="card-header-row">
                   <h2 className="card-title">In the room</h2>
                   <span className="count-pill">
-                    {participants.length || 1}
+                    {participants.length}
                   </span>
                 </div>
 
                 <div className="participants-list">
                   {participants.length === 0 ? (
                     <div className="participant-item">
-                      <div className="participant-header">
-                        <span
-                          className="avatar-circle"
-                          style={{
-                            backgroundColor: "#fef3c7",
-                            color: "#92400e",
-                          }}
-                        >
-                          {(username.trim() || joinUsername.trim() || "Y")[0].toUpperCase()}
-                        </span>
-                        <div className="participant-meta">
-                          <div className="participant-name">
-                            {username.trim() || joinUsername.trim() || "You"}
-                            <span className="you-tag">you</span>
-                          </div>
-                          <span className="role-chip host">Host</span>
-                        </div>
+                      <div className="participant-name">
+                        {isConnected ? "Joining room..." : "Connecting to server..."}
                       </div>
                     </div>
                   ) : (
