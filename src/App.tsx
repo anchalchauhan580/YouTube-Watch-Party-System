@@ -5,7 +5,12 @@ import "./App.css";
 
 const socket = io(
   import.meta.env.VITE_SOCKET_URL ||
-    (import.meta.env.DEV ? "http://localhost:5000" : window.location.origin)
+    import.meta.env.VITE_SOCKET_SERVER_URL ||
+    (import.meta.env.DEV ? "http://localhost:5000" : window.location.origin),
+  {
+    autoConnect: true,
+    transports: ["websocket", "polling"],
+  }
 );
 
 type Participant = {
@@ -608,37 +613,43 @@ function App() {
     // ---------------- PARTICIPANT REMOVED ----------------
 
     const handleParticipantRemoved = (data: {
-      roomId: string;
+      roomId?: string;
       userId: string;
+      participants?: Participant[];
     }) => {
-      if (data.userId !== socket.id) {
+      if (data.userId === socket.id) {
+        alert("You have been removed from the room");
+
+        try {
+          if (data.roomId) {
+            localStorage.removeItem(`host_token_${data.roomId}`);
+            localStorage.removeItem(`creator_name_${data.roomId}`);
+          }
+        } catch {
+          // ignore
+        }
+
+        roomIdRef.current = "";
+        setRoomId("");
+        roomHostTokenRef.current = null;
+
+        setParticipants([]);
+        setControlRequests([]);
+
+        playerRef.current = null;
+        pendingSyncRef.current = null;
+
+        remoteStateLockRef.current = null;
+        remoteSeekLockRef.current = false;
+
+        lastTimeRef.current = 0;
+        playerStateRef.current = 2;
         return;
       }
 
-      alert("You have been removed from the room");
-
-      try {
-        localStorage.removeItem(`host_token_${data.roomId}`);
-        localStorage.removeItem(`creator_name_${data.roomId}`);
-      } catch {
-        // ignore
+      if (data.participants) {
+        setParticipants(data.participants);
       }
-
-      roomIdRef.current = "";
-      setRoomId("");
-      roomHostTokenRef.current = null;
-
-      setParticipants([]);
-      setControlRequests([]);
-
-      playerRef.current = null;
-      pendingSyncRef.current = null;
-
-      remoteStateLockRef.current = null;
-      remoteSeekLockRef.current = false;
-
-      lastTimeRef.current = 0;
-      playerStateRef.current = 2;
     };
 
     const handleReconnect = () => {
@@ -1568,6 +1579,24 @@ function App() {
                                   }
                                 >
                                   Moderator
+                                </button>
+                                <button
+                                  type="button"
+                                  className={`segment-btn ${
+                                    user.role === "Host" ? "active" : ""
+                                  }`}
+                                  onClick={() => {
+                                    if (
+                                      window.confirm(
+                                        `Transfer Host role to ${user.username}? You will become a Moderator.`
+                                      )
+                                    ) {
+                                      assignRole(user.userId, "Host");
+                                    }
+                                  }}
+                                  title="Transfer Host permissions"
+                                >
+                                  Host
                                 </button>
                               </div>
 

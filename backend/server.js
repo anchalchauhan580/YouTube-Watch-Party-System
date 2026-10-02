@@ -2,11 +2,19 @@ const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const crypto = require("crypto");
+const path = require("path");
+const fs = require("fs");
 const { Server } = require("socket.io");
 
 const app = express();
 
 app.use(cors());
+
+// Serve static frontend files from dist if built
+const distPath = path.join(__dirname, "../dist");
+if (fs.existsSync(distPath)) {
+  app.use(express.static(distPath));
+}
 
 const rooms = {};
 
@@ -125,6 +133,9 @@ const addRoomMember = (socket, roomId, username, room, role) => {
   console.log(`${username} joined room ${roomId} as ${role}`);
 
   io.to(roomId).emit("user_joined", {
+    username,
+    userId: socket.id,
+    role,
     participants: room.participants,
   });
 
@@ -224,9 +235,16 @@ const handleJoinOrCreate = (socket, { roomId, username, hostToken, action, isCre
   }
 };
 
-app.get("/", (req, res) => {
-  res.send("Watch Party Server is running");
-});
+if (fs.existsSync(distPath)) {
+  app.use((req, res, next) => {
+    if (req.path.startsWith("/socket.io")) return next();
+    res.sendFile(path.join(distPath, "index.html"));
+  });
+} else {
+  app.get("/", (req, res) => {
+    res.send("Watch Party Server is running");
+  });
+}
 
 // JOIN ROOM
 io.on("connection", (socket) => {
@@ -357,16 +375,21 @@ io.on("connection", (socket) => {
   });
 
   // PLAY
-  socket.on("play", ({ roomId, currentTime }) => {
-    const cleanRoomId = String(roomId || "").trim().toUpperCase();
+  socket.on("play", (data) => {
+    const cleanRoomId = String(data?.roomId || socket.data.roomId || "").trim().toUpperCase();
+    const currentTimeVal = data?.currentTime;
     const room = rooms[cleanRoomId];
-    if (!room || !Number.isFinite(currentTime) || currentTime < 0) return;
+    if (!room) return;
 
     const user = room.participants.find(
       (participant) => participant.userId === socket.id
     );
 
     if (!user || !canControl(user)) return;
+
+    const currentTime = Number.isFinite(currentTimeVal) && currentTimeVal >= 0
+      ? currentTimeVal
+      : room.currentTime;
 
     room.playState = "playing";
     room.currentTime = currentTime;
@@ -379,16 +402,21 @@ io.on("connection", (socket) => {
   });
 
   // PAUSE
-  socket.on("pause", ({ roomId, currentTime }) => {
-    const cleanRoomId = String(roomId || "").trim().toUpperCase();
+  socket.on("pause", (data) => {
+    const cleanRoomId = String(data?.roomId || socket.data.roomId || "").trim().toUpperCase();
+    const currentTimeVal = data?.currentTime;
     const room = rooms[cleanRoomId];
-    if (!room || !Number.isFinite(currentTime) || currentTime < 0) return;
+    if (!room) return;
 
     const user = room.participants.find(
       (participant) => participant.userId === socket.id
     );
 
     if (!user || !canControl(user)) return;
+
+    const currentTime = Number.isFinite(currentTimeVal) && currentTimeVal >= 0
+      ? currentTimeVal
+      : room.currentTime;
 
     room.playState = "paused";
     room.currentTime = currentTime;
@@ -401,16 +429,21 @@ io.on("connection", (socket) => {
   });
 
   // SEEK
-  socket.on("seek", ({ roomId, time }) => {
-    const cleanRoomId = String(roomId || "").trim().toUpperCase();
+  socket.on("seek", (data) => {
+    const cleanRoomId = String(data?.roomId || socket.data.roomId || "").trim().toUpperCase();
+    const timeVal = data?.time ?? data?.currentTime;
     const room = rooms[cleanRoomId];
-    if (!room || !Number.isFinite(time) || time < 0) return;
+    if (!room) return;
 
     const user = room.participants.find(
       (participant) => participant.userId === socket.id
     );
 
     if (!user || !canControl(user)) return;
+
+    const time = Number.isFinite(timeVal) && timeVal >= 0
+      ? timeVal
+      : room.currentTime;
 
     room.currentTime = time;
 
@@ -422,8 +455,9 @@ io.on("connection", (socket) => {
   });
 
   // CHANGE VIDEO
-  socket.on("change_video", ({ roomId, videoId }) => {
-    const cleanRoomId = String(roomId || "").trim().toUpperCase();
+  socket.on("change_video", (data) => {
+    const cleanRoomId = String(data?.roomId || socket.data.roomId || "").trim().toUpperCase();
+    const videoId = data?.videoId;
     const room = rooms[cleanRoomId];
     if (!room || typeof videoId !== "string" || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) return;
 
@@ -445,8 +479,9 @@ io.on("connection", (socket) => {
   });
 
   // ASSIGN ROLE
-  socket.on("assign_role", ({ roomId, userId, role }) => {
-    const cleanRoomId = String(roomId || "").trim().toUpperCase();
+  socket.on("assign_role", (data) => {
+    const { roomId, userId, role } = data || {};
+    const cleanRoomId = String(roomId || socket.data.roomId || "").trim().toUpperCase();
     const room = rooms[cleanRoomId];
     if (!room) return;
 
@@ -462,11 +497,34 @@ io.on("connection", (socket) => {
 
     if (!user || userId === socket.id) return;
 
-    if (role !== "Participant" && role !== "Moderator") return;
+    if (role === "Host") {
+      // Transfer Host role
+      host.role = "Moderator";
+      user.role = "Host";
+      room.creatorUserId = user.userId;
+      room.creatorUsername = user.username;
 
-    user.role = role;
+      io.to(cleanRoomId).emit("role_assigned", {
+        userId: user.userId,
+        username: user.username,
+        role: "Host",
+        participants: room.participants,
+      });
+      io.to(cleanRoomId).emit("role_assigned", {
+        userId: host.userId,
+        username: host.username,
+        role: "Moderator",
+        participants: room.participants,
+      });
+      emitControlRequests(cleanRoomId, room);
+      return;
+    }
 
-    if (role === "Moderator") {
+    if (role !== "Participant" && role !== "Moderator" && role !== "Viewer") return;
+
+    user.role = role === "Viewer" ? "Participant" : role;
+
+    if (user.role === "Moderator") {
       room.controlRequests = room.controlRequests.filter(
         (request) => request.userId !== userId
       );
@@ -476,17 +534,61 @@ io.on("connection", (socket) => {
       });
     }
 
-    console.log(`${user.username} is now ${role}`);
+    console.log(`${user.username} is now ${user.role}`);
 
     io.to(cleanRoomId).emit("role_assigned", {
+      userId: user.userId,
+      username: user.username,
+      role: user.role,
+      participants: room.participants,
+    });
+    emitControlRequests(cleanRoomId, room);
+  });
+
+  // TRANSFER HOST
+  socket.on("transfer_host", (data) => {
+    const { roomId, userId } = data || {};
+    const cleanRoomId = String(roomId || socket.data.roomId || "").trim().toUpperCase();
+    const room = rooms[cleanRoomId];
+    if (!room) return;
+
+    const currentHost = room.participants.find(
+      (participant) => participant.userId === socket.id
+    );
+
+    if (!currentHost || currentHost.role !== "Host") return;
+
+    const targetUser = room.participants.find(
+      (participant) => participant.userId === userId
+    );
+
+    if (!targetUser || userId === socket.id) return;
+
+    currentHost.role = "Moderator";
+    targetUser.role = "Host";
+
+    room.creatorUserId = targetUser.userId;
+    room.creatorUsername = targetUser.username;
+
+    io.to(cleanRoomId).emit("role_assigned", {
+      userId: targetUser.userId,
+      username: targetUser.username,
+      role: "Host",
+      participants: room.participants,
+    });
+    io.to(cleanRoomId).emit("role_assigned", {
+      userId: currentHost.userId,
+      username: currentHost.username,
+      role: "Moderator",
       participants: room.participants,
     });
     emitControlRequests(cleanRoomId, room);
   });
 
   // REMOVE PARTICIPANT
-  socket.on("remove_participant", ({ roomId, userId }) => {
-    const cleanRoomId = String(roomId || "").trim().toUpperCase();
+  socket.on("remove_participant", (data) => {
+    const { roomId, userId } = data || {};
+    const cleanRoomId = String(roomId || socket.data.roomId || "").trim().toUpperCase();
     const room = rooms[cleanRoomId];
     if (!room) return;
 
@@ -516,9 +618,17 @@ io.on("connection", (socket) => {
     io.to(userId).emit("participant_removed", {
       roomId: cleanRoomId,
       userId,
+      participants: room.participants,
+    });
+
+    io.to(cleanRoomId).emit("participant_removed", {
+      userId,
+      participants: room.participants,
     });
 
     io.to(cleanRoomId).emit("user_left", {
+      username: removedUser.username,
+      userId,
       participants: room.participants,
     });
     emitControlRequests(cleanRoomId, room);
